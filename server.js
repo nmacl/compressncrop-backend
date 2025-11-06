@@ -8,8 +8,16 @@ const path = require('path');
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Enable CORS for your frontend
-app.use(cors());
+// Enable CORS for your frontend with more permissive settings
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-Session-ID'],
+  credentials: false
+}));
+
+// Handle OPTIONS requests
+app.options('*', cors());
 
 app.get('/', (req, res) => {
   res.json({ status: 'Image processor API is running' });
@@ -19,10 +27,16 @@ app.get('/', (req, res) => {
 app.get('/api/progress/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   
+  console.log(`[${sessionId}] SSE connection request received`);
+  
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  
+  // Flush headers immediately
+  res.flushHeaders();
   
   // Store response object for this session
   if (!global.progressClients) {
@@ -35,8 +49,14 @@ app.get('/api/progress/:sessionId', (req, res) => {
   // Send initial connection message
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'Progress tracking connected' })}\n\n`);
   
+  // Keep connection alive with heartbeat
+  const heartbeat = setInterval(() => {
+    res.write(`: heartbeat\n\n`);
+  }, 15000);
+  
   req.on('close', () => {
     console.log(`[${sessionId}] SSE connection closed`);
+    clearInterval(heartbeat);
     global.progressClients.delete(sessionId);
   });
 });
@@ -110,7 +130,7 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
           filename: file.originalname
         });
 
-        let quality = 85; // Start higher for better quality
+        let quality = 95; // Start with high quality
         let processedImage;
         let compressionAttempts = 0;
 
@@ -118,7 +138,7 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
         const metadata = await sharp(file.buffer).metadata();
         console.log(`[${sessionId}]    Original format: ${metadata.format}, ${metadata.width}x${metadata.height}`);
 
-        // Create initial pipeline - resize first, then convert to JPEG
+        // Create initial pipeline - resize first, then convert to JPEG with high quality
         let pipeline = sharp(file.buffer)
           .resize(TARGET_WIDTH, TARGET_HEIGHT, {
             fit: 'cover',
@@ -132,41 +152,50 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
         processedImage = await pipeline.toBuffer();
         compressionAttempts++;
 
-        // Reduce quality until file size is under 5KB
-        while (processedImage.length > MAX_FILE_SIZE && quality > 10) {
-          quality -= 5;
-          
-          pipeline = sharp(file.buffer)
-            .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-              fit: 'cover',
-              position: 'center'
-            })
-            .jpeg({ 
-              quality,
-              mozjpeg: true
-            });
-          
-          processedImage = await pipeline.toBuffer();
-          compressionAttempts++;
-        }
+        console.log(`[${sessionId}]    After resize at quality ${quality}: ${(processedImage.length / 1024).toFixed(2)} KB`);
 
-        // If still too large at quality 10, try more aggressive optimization
+        // Only compress if already over 500KB
         if (processedImage.length > MAX_FILE_SIZE) {
-          console.log(`[${sessionId}]    Still too large, applying aggressive compression...`);
+          console.log(`[${sessionId}]    Image over 500KB, starting compression...`);
           
-          pipeline = sharp(file.buffer)
-            .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-              fit: 'cover',
-              position: 'center'
-            })
-            .jpeg({ 
-              quality: 10,
-              chromaSubsampling: '4:2:0',
-              mozjpeg: true
-            });
-          
-          processedImage = await pipeline.toBuffer();
-          quality = 10;
+          // Reduce quality until file size is under 500KB
+          while (processedImage.length > MAX_FILE_SIZE && quality > 10) {
+            quality -= 5;
+            
+            pipeline = sharp(file.buffer)
+              .resize(TARGET_WIDTH, TARGET_HEIGHT, {
+                fit: 'cover',
+                position: 'center'
+              })
+              .jpeg({ 
+                quality,
+                mozjpeg: true
+              });
+            
+            processedImage = await pipeline.toBuffer();
+            compressionAttempts++;
+          }
+
+          // If still too large at quality 10, try more aggressive optimization
+          if (processedImage.length > MAX_FILE_SIZE) {
+            console.log(`[${sessionId}]    Still too large, applying aggressive compression...`);
+            
+            pipeline = sharp(file.buffer)
+              .resize(TARGET_WIDTH, TARGET_HEIGHT, {
+                fit: 'cover',
+                position: 'center'
+              })
+              .jpeg({ 
+                quality: 10,
+                chromaSubsampling: '4:2:0',
+                mozjpeg: true
+              });
+            
+            processedImage = await pipeline.toBuffer();
+            quality = 10;
+          }
+        } else {
+          console.log(`[${sessionId}]    Image already under 500KB, no compression needed!`);
         }
 
         // Add to zip
