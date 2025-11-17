@@ -138,12 +138,14 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
         const metadata = await sharp(file.buffer).metadata();
         console.log(`[${sessionId}]    Original format: ${metadata.format}, ${metadata.width}x${metadata.height}`);
 
-        // Create initial pipeline - resize first, then convert to JPEG with high quality
+        // Create initial pipeline with high-quality resize settings
         let pipeline = sharp(file.buffer)
           .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-            fit: 'cover',
-            position: 'center'
+            fit: 'contain',
+            background: { r: 255, g: 255, b: 255, alpha: 1 },
+            kernel: sharp.kernel.lanczos3 // High-quality resampling (sharper than default)
           })
+          .sharpen() // Add slight sharpening after resize to counteract softening
           .jpeg({ 
             quality,
             mozjpeg: true // Use mozjpeg for better compression
@@ -164,9 +166,11 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
             
             pipeline = sharp(file.buffer)
               .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-                fit: 'cover',
-                position: 'center'
+                fit: 'contain',
+                background: { r: 255, g: 255, b: 255, alpha: 1 },
+                kernel: sharp.kernel.lanczos3
               })
+              .sharpen()
               .jpeg({ 
                 quality,
                 mozjpeg: true
@@ -182,9 +186,11 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
             
             pipeline = sharp(file.buffer)
               .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-                fit: 'cover',
-                position: 'center'
+                fit: 'contain',
+                background: { r: 255, g: 255, b: 255, alpha: 1 },
+                kernel: sharp.kernel.lanczos3
               })
+              .sharpen()
               .jpeg({ 
                 quality: 10,
                 chromaSubsampling: '4:2:0',
