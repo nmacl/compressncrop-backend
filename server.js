@@ -136,28 +136,50 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
 
         // Get image metadata to understand the original format
         const metadata = await sharp(file.buffer).metadata();
+        const sourceAspectRatio = metadata.width / metadata.height;
+        const targetAspectRatio = TARGET_WIDTH / TARGET_HEIGHT;
+        const aspectRatioDiff = Math.abs(sourceAspectRatio - targetAspectRatio);
+        
         console.log(`[${sessionId}]    Original format: ${metadata.format}, ${metadata.width}x${metadata.height}`);
+        console.log(`[${sessionId}]    Aspect ratio: ${sourceAspectRatio.toFixed(3)} (target: ${targetAspectRatio.toFixed(3)}, diff: ${aspectRatioDiff.toFixed(3)})`);
+        
+        // Check if image is already the correct size and under the file size limit
+        const isAlreadyCorrectSize = metadata.width === TARGET_WIDTH && metadata.height === TARGET_HEIGHT;
+        const isUnderSizeLimit = file.size <= MAX_FILE_SIZE;
+        
+        if (isAlreadyCorrectSize && isUnderSizeLimit) {
+          console.log(`[${sessionId}]    Image already correct dimensions and under 500KB - using original!`);
+          processedImage = file.buffer;
+          compressionAttempts = 0;
+        } else {
+          // Smart cropping: use 'cover' if aspect ratios are similar (< 10% difference), 'contain' if very different
+          // This prevents cutting off products while still filling the frame when possible
+          const useCover = aspectRatioDiff < 0.1; // 10% threshold
+          const fitMode = useCover ? 'cover' : 'contain';
+          
+          console.log(`[${sessionId}]    Using fit mode: ${fitMode} ${useCover ? '(minimal cropping)' : '(white bars to preserve product)'}`);
 
-        // Create initial pipeline with high-quality resize settings
-        let pipeline = sharp(file.buffer)
-          .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-            fit: 'contain',
-            background: { r: 255, g: 255, b: 255, alpha: 1 },
-            kernel: sharp.kernel.lanczos3 // High-quality resampling (sharper than default)
-          })
-          .sharpen() // Add slight sharpening after resize to counteract softening
-          .jpeg({ 
-            quality,
-            mozjpeg: true // Use mozjpeg for better compression
-          });
+          // Create initial pipeline with high-quality resize settings
+          let pipeline = sharp(file.buffer)
+            .resize(TARGET_WIDTH, TARGET_HEIGHT, {
+              fit: fitMode,
+              position: useCover ? 'center' : undefined,
+              background: { r: 255, g: 255, b: 255, alpha: 1 },
+              kernel: sharp.kernel.lanczos3 // High-quality resampling (sharper than default)
+            })
+            .sharpen() // Add slight sharpening after resize to counteract softening
+            .jpeg({ 
+              quality,
+              mozjpeg: true // Use mozjpeg for better compression
+            });
 
-        processedImage = await pipeline.toBuffer();
-        compressionAttempts++;
+          processedImage = await pipeline.toBuffer();
+          compressionAttempts++;
 
-        console.log(`[${sessionId}]    After resize at quality ${quality}: ${(processedImage.length / 1024).toFixed(2)} KB`);
+          console.log(`[${sessionId}]    After resize at quality ${quality}: ${(processedImage.length / 1024).toFixed(2)} KB`);
 
-        // Only compress if already over 500KB
-        if (processedImage.length > MAX_FILE_SIZE) {
+          // Only compress if already over 500KB
+          if (processedImage.length > MAX_FILE_SIZE) {
           console.log(`[${sessionId}]    Image over 500KB, starting compression...`);
           
           // Reduce quality until file size is under 500KB
@@ -166,7 +188,8 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
             
             pipeline = sharp(file.buffer)
               .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-                fit: 'contain',
+                fit: fitMode,
+                position: useCover ? 'center' : undefined,
                 background: { r: 255, g: 255, b: 255, alpha: 1 },
                 kernel: sharp.kernel.lanczos3
               })
@@ -186,7 +209,8 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
             
             pipeline = sharp(file.buffer)
               .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-                fit: 'contain',
+                fit: fitMode,
+                position: useCover ? 'center' : undefined,
                 background: { r: 255, g: 255, b: 255, alpha: 1 },
                 kernel: sharp.kernel.lanczos3
               })
@@ -203,6 +227,7 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
         } else {
           console.log(`[${sessionId}]    Image already under 500KB, no compression needed!`);
         }
+        } // End of else block for processing (vs using original)
 
         // Add to zip
         archive.append(processedImage, { name: `${originalName}.jpg` });
