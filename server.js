@@ -8,7 +8,6 @@ const path = require('path');
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Enable CORS for your frontend with more permissive settings
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -16,7 +15,6 @@ app.use(cors({
   credentials: false
 }));
 
-// Handle OPTIONS requests
 app.options('*', cors());
 
 app.get('/', (req, res) => {
@@ -33,12 +31,10 @@ app.get('/api/progress/:sessionId', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   
-  // Flush headers immediately
   res.flushHeaders();
   
-  // Store response object for this session
   if (!global.progressClients) {
     global.progressClients = new Map();
   }
@@ -46,10 +42,8 @@ app.get('/api/progress/:sessionId', (req, res) => {
   
   console.log(`[${sessionId}] SSE connection established`);
   
-  // Send initial connection message
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'Progress tracking connected' })}\n\n`);
   
-  // Keep connection alive with heartbeat
   const heartbeat = setInterval(() => {
     res.write(`: heartbeat\n\n`);
   }, 15000);
@@ -61,7 +55,6 @@ app.get('/api/progress/:sessionId', (req, res) => {
   });
 });
 
-// Helper function to send progress updates
 function sendProgress(sessionId, data) {
   if (!global.progressClients) return;
   
@@ -94,9 +87,8 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
 
     const TARGET_WIDTH = 1260;
     const TARGET_HEIGHT = 1726;
-    const MAX_FILE_SIZE = 500000; // 500KB in bytes
+    const MAX_FILE_SIZE = 500000; // 500KB
 
-    // Set up zip stream
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename=processed-images.zip');
 
@@ -109,7 +101,6 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
       totalFiles
     });
 
-    // Process each image
     let processedCount = 0;
     const startTime = Date.now();
 
@@ -130,115 +121,63 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
           filename: file.originalname
         });
 
-        let quality = 95; // Start with high quality
-        let processedImage;
-        let compressionAttempts = 0;
-
-        // Get image metadata to understand the original format
         const metadata = await sharp(file.buffer).metadata();
-        const sourceAspectRatio = metadata.width / metadata.height;
-        const targetAspectRatio = TARGET_WIDTH / TARGET_HEIGHT;
-        const aspectRatioDiff = Math.abs(sourceAspectRatio - targetAspectRatio);
+        console.log(`[${sessionId}]    Original: ${metadata.format}, ${metadata.width}x${metadata.height}`);
+
+        let processedImage;
         
-        console.log(`[${sessionId}]    Original format: ${metadata.format}, ${metadata.width}x${metadata.height}`);
-        console.log(`[${sessionId}]    Aspect ratio: ${sourceAspectRatio.toFixed(3)} (target: ${targetAspectRatio.toFixed(3)}, diff: ${aspectRatioDiff.toFixed(3)})`);
-        
-        // Check if image is already the correct size and under the file size limit
-        const isAlreadyCorrectSize = metadata.width === TARGET_WIDTH && metadata.height === TARGET_HEIGHT;
-        const isUnderSizeLimit = file.size <= MAX_FILE_SIZE;
-        
-        if (isAlreadyCorrectSize && isUnderSizeLimit) {
-          console.log(`[${sessionId}]    Image already correct dimensions and under 500KB - using original!`);
+        // If already correct dimensions and under 500KB, use original
+        if (metadata.width === TARGET_WIDTH && metadata.height === TARGET_HEIGHT && originalSize <= MAX_FILE_SIZE) {
+          console.log(`[${sessionId}]    ✓ Already perfect - using original!`);
           processedImage = file.buffer;
-          compressionAttempts = 0;
         } else {
-          // Smart cropping: use 'cover' if aspect ratios are similar (< 10% difference), 'contain' if very different
-          // This prevents cutting off products while still filling the frame when possible
-          const useCover = aspectRatioDiff < 0.1; // 10% threshold
-          const fitMode = useCover ? 'cover' : 'contain';
+          // Otherwise, resize with cover (crop to fit)
+          console.log(`[${sessionId}]    Resizing to ${TARGET_WIDTH}x${TARGET_HEIGHT}...`);
           
-          console.log(`[${sessionId}]    Using fit mode: ${fitMode} ${useCover ? '(minimal cropping)' : '(white bars to preserve product)'}`);
-
-          // Create initial pipeline with high-quality resize settings
-          let pipeline = sharp(file.buffer)
+          processedImage = await sharp(file.buffer)
             .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-              fit: fitMode,
-              position: useCover ? 'center' : undefined,
-              background: { r: 255, g: 255, b: 255, alpha: 1 },
-              kernel: sharp.kernel.lanczos3 // High-quality resampling (sharper than default)
+              fit: 'cover',
+              position: 'center'
             })
-            .sharpen() // Add slight sharpening after resize to counteract softening
             .jpeg({ 
-              quality,
-              mozjpeg: true // Use mozjpeg for better compression
-            });
-
-          processedImage = await pipeline.toBuffer();
-          compressionAttempts++;
-
-          console.log(`[${sessionId}]    After resize at quality ${quality}: ${(processedImage.length / 1024).toFixed(2)} KB`);
-
-          // Only compress if already over 500KB
-          if (processedImage.length > MAX_FILE_SIZE) {
-          console.log(`[${sessionId}]    Image over 500KB, starting compression...`);
+              quality: 90,
+              mozjpeg: true
+            })
+            .toBuffer();
           
-          // Reduce quality until file size is under 500KB
-          while (processedImage.length > MAX_FILE_SIZE && quality > 10) {
-            quality -= 5;
-            
-            pipeline = sharp(file.buffer)
-              .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-                fit: fitMode,
-                position: useCover ? 'center' : undefined,
-                background: { r: 255, g: 255, b: 255, alpha: 1 },
-                kernel: sharp.kernel.lanczos3
-              })
-              .sharpen()
-              .jpeg({ 
-                quality,
-                mozjpeg: true
-              });
-            
-            processedImage = await pipeline.toBuffer();
-            compressionAttempts++;
-          }
-
-          // If still too large at quality 10, try more aggressive optimization
+          console.log(`[${sessionId}]    After resize: ${(processedImage.length / 1024).toFixed(2)} KB`);
+          
+          // Only if over 500KB, compress further
           if (processedImage.length > MAX_FILE_SIZE) {
-            console.log(`[${sessionId}]    Still too large, applying aggressive compression...`);
+            console.log(`[${sessionId}]    Compressing to under 500KB...`);
+            let quality = 85;
             
-            pipeline = sharp(file.buffer)
-              .resize(TARGET_WIDTH, TARGET_HEIGHT, {
-                fit: fitMode,
-                position: useCover ? 'center' : undefined,
-                background: { r: 255, g: 255, b: 255, alpha: 1 },
-                kernel: sharp.kernel.lanczos3
-              })
-              .sharpen()
-              .jpeg({ 
-                quality: 10,
-                chromaSubsampling: '4:2:0',
-                mozjpeg: true
-              });
+            while (processedImage.length > MAX_FILE_SIZE && quality > 60) {
+              processedImage = await sharp(file.buffer)
+                .resize(TARGET_WIDTH, TARGET_HEIGHT, {
+                  fit: 'cover',
+                  position: 'center'
+                })
+                .jpeg({ 
+                  quality,
+                  mozjpeg: true
+                })
+                .toBuffer();
+              
+              quality -= 5;
+            }
             
-            processedImage = await pipeline.toBuffer();
-            quality = 10;
+            console.log(`[${sessionId}]    Final: ${(processedImage.length / 1024).toFixed(2)} KB at quality ${quality + 5}`);
           }
-        } else {
-          console.log(`[${sessionId}]    Image already under 500KB, no compression needed!`);
         }
-        } // End of else block for processing (vs using original)
 
-        // Add to zip
         archive.append(processedImage, { name: `${originalName}.jpg` });
         
         processedCount++;
         const fileProcessTime = Date.now() - fileStartTime;
-        const compressionRatio = ((1 - processedImage.length / originalSize) * 100).toFixed(1);
         
         console.log(`[${sessionId}] ✓ Completed ${processedCount}/${totalFiles}: ${originalName}.jpg`);
-        console.log(`   - Original: ${(originalSize / 1024).toFixed(2)} KB → Final: ${(processedImage.length / 1024).toFixed(2)} KB (${compressionRatio}% reduction)`);
-        console.log(`   - Quality: ${quality}%, Attempts: ${compressionAttempts}, Time: ${fileProcessTime}ms`);
+        console.log(`   - ${(originalSize / 1024).toFixed(2)} KB → ${(processedImage.length / 1024).toFixed(2)} KB (${fileProcessTime}ms)`);
         
         sendProgress(sessionId, {
           type: 'file_completed',
@@ -248,8 +187,6 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
           filename: file.originalname,
           originalSize: originalSize,
           finalSize: processedImage.length,
-          quality: quality,
-          compressionRatio: compressionRatio,
           processingTime: fileProcessTime
         });
 
@@ -268,9 +205,8 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
     }
 
     const totalTime = Date.now() - startTime;
-    const avgTimePerFile = processedCount > 0 ? (totalTime / processedCount).toFixed(0) : 0;
     
-    console.log(`[${sessionId}] All processing complete: ${processedCount}/${totalFiles} files in ${(totalTime / 1000).toFixed(2)}s (avg ${avgTimePerFile}ms/file)`);
+    console.log(`[${sessionId}] All processing complete: ${processedCount}/${totalFiles} files in ${(totalTime / 1000).toFixed(2)}s`);
     
     sendProgress(sessionId, {
       type: 'creating_zip',
@@ -293,7 +229,6 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
       zipSize: finalSize
     });
     
-    // Clean up progress client after a delay
     setTimeout(() => {
       if (global.progressClients) {
         global.progressClients.delete(sessionId);
