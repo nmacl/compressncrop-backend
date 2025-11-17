@@ -87,6 +87,7 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
 
     const TARGET_WIDTH = 1260;
     const TARGET_HEIGHT = 1726;
+    const TARGET_ASPECT_RATIO = TARGET_WIDTH / TARGET_HEIGHT;
     const MAX_FILE_SIZE = 500000; // 500KB
 
     res.setHeader('Content-Type', 'application/zip');
@@ -122,17 +123,59 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
         });
 
         const metadata = await sharp(file.buffer).metadata();
-        console.log(`[${sessionId}]    Original: ${metadata.format}, ${metadata.width}x${metadata.height}`);
+        const sourceAspectRatio = metadata.width / metadata.height;
+        
+        console.log(`[${sessionId}]    Original: ${metadata.format}, ${metadata.width}x${metadata.height} (AR: ${sourceAspectRatio.toFixed(3)})`);
 
         let processedImage;
+        let action = '';
         
-        // If already correct dimensions and under 500KB, use original
-        if (metadata.width === TARGET_WIDTH && metadata.height === TARGET_HEIGHT && originalSize <= MAX_FILE_SIZE) {
-          console.log(`[${sessionId}]    ✓ Already perfect - using original!`);
+        // Check if aspect ratio matches (within 1% tolerance)
+        const aspectRatioMatches = Math.abs(sourceAspectRatio - TARGET_ASPECT_RATIO) < 0.01;
+        
+        // If already correct aspect ratio and under 500KB, use original
+        if (aspectRatioMatches && originalSize <= MAX_FILE_SIZE) {
+          console.log(`[${sessionId}]    ✓ Correct aspect ratio and under 500KB - using original!`);
           processedImage = file.buffer;
-        } else {
-          // Otherwise, resize with cover (crop to fit)
-          console.log(`[${sessionId}]    Resizing to ${TARGET_WIDTH}x${TARGET_HEIGHT}...`);
+          action = 'kept_original';
+        } 
+        // If image is smaller than target, just crop to aspect ratio (no upscaling)
+        else if (metadata.width < TARGET_WIDTH || metadata.height < TARGET_HEIGHT) {
+          console.log(`[${sessionId}]    Image is smaller than target - cropping to aspect ratio only (no upscaling)`);
+          
+          // Calculate dimensions to crop to target aspect ratio without upscaling
+          let cropWidth, cropHeight;
+          
+          if (sourceAspectRatio > TARGET_ASPECT_RATIO) {
+            // Image is wider - crop width
+            cropHeight = metadata.height;
+            cropWidth = Math.round(cropHeight * TARGET_ASPECT_RATIO);
+          } else {
+            // Image is taller - crop height
+            cropWidth = metadata.width;
+            cropHeight = Math.round(cropWidth / TARGET_ASPECT_RATIO);
+          }
+          
+          console.log(`[${sessionId}]    Cropping from ${metadata.width}x${metadata.height} to ${cropWidth}x${cropHeight}`);
+          
+          processedImage = await sharp(file.buffer)
+            .extract({
+              left: Math.round((metadata.width - cropWidth) / 2),
+              top: Math.round((metadata.height - cropHeight) / 2),
+              width: cropWidth,
+              height: cropHeight
+            })
+            .jpeg({ 
+              quality: 92,
+              mozjpeg: true
+            })
+            .toBuffer();
+          
+          action = 'cropped_only';
+        }
+        // If image is larger, downscale to target dimensions
+        else {
+          console.log(`[${sessionId}]    Downscaling from ${metadata.width}x${metadata.height} to ${TARGET_WIDTH}x${TARGET_HEIGHT}`);
           
           processedImage = await sharp(file.buffer)
             .resize(TARGET_WIDTH, TARGET_HEIGHT, {
@@ -145,9 +188,9 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
             })
             .toBuffer();
           
-          console.log(`[${sessionId}]    After resize: ${(processedImage.length / 1024).toFixed(2)} KB`);
+          console.log(`[${sessionId}]    After downscale: ${(processedImage.length / 1024).toFixed(2)} KB`);
           
-          // Only if over 500KB, compress further
+          // If still over 500KB, compress further
           if (processedImage.length > MAX_FILE_SIZE) {
             console.log(`[${sessionId}]    Compressing to under 500KB...`);
             let quality = 85;
@@ -167,8 +210,10 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
               quality -= 5;
             }
             
-            console.log(`[${sessionId}]    Final: ${(processedImage.length / 1024).toFixed(2)} KB at quality ${quality + 5}`);
+            console.log(`[${sessionId}]    Compressed to: ${(processedImage.length / 1024).toFixed(2)} KB at quality ${quality + 5}`);
           }
+          
+          action = 'downscaled';
         }
 
         archive.append(processedImage, { name: `${originalName}.jpg` });
@@ -176,7 +221,7 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
         processedCount++;
         const fileProcessTime = Date.now() - fileStartTime;
         
-        console.log(`[${sessionId}] ✓ Completed ${processedCount}/${totalFiles}: ${originalName}.jpg`);
+        console.log(`[${sessionId}] ✓ Completed ${processedCount}/${totalFiles}: ${originalName}.jpg [${action}]`);
         console.log(`   - ${(originalSize / 1024).toFixed(2)} KB → ${(processedImage.length / 1024).toFixed(2)} KB (${fileProcessTime}ms)`);
         
         sendProgress(sessionId, {
@@ -187,7 +232,8 @@ app.post('/api/process', upload.array('images'), async (req, res) => {
           filename: file.originalname,
           originalSize: originalSize,
           finalSize: processedImage.length,
-          processingTime: fileProcessTime
+          processingTime: fileProcessTime,
+          action: action
         });
 
       } catch (err) {
